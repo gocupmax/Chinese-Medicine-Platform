@@ -6,7 +6,7 @@ import { eq } from "drizzle-orm";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
-import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
 import { execSync } from "child_process";
 
 const upload = multer({
@@ -36,9 +36,14 @@ function fixFilename(rawName: string): string {
   }
 }
 
-function getAnthropicClient(): Anthropic | null {
+function getAIClient(): OpenAI | null {
+  const apiKey = process.env.KIMI_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
   try {
-    return new Anthropic();
+    return new OpenAI({
+      apiKey,
+      baseURL: process.env.AI_BASE_URL || "https://api.moonshot.ai/v1",
+    });
   } catch {
     return null;
   }
@@ -85,26 +90,82 @@ async function extractTextFromFile(filePath: string, fileType: string, originalN
 }
 
 async function generateWithAI(prompt: string, systemPrompt?: string): Promise<string> {
-  const client = getAnthropicClient();
+  const client = getAIClient();
   if (!client) {
-    return "AI服務暫時不可用，請稍後再試。";
+    return "AI服務未配置，請設置 KIMI_API_KEY 環境變量。";
   }
   try {
-    const message = await client.messages.create({
-      model: "claude_sonnet_4_6",
-      max_tokens: 4096,
-      system: systemPrompt || "你是一位專業的中醫學教授，專門協助中醫碩士課程的學生學習。請用繁體中文回答。",
-      messages: [{ role: "user", content: prompt }],
-    });
-    const block = message.content[0];
-    return block.type === "text" ? block.text : "";
+    const model = process.env.AI_MODEL || "kimi-k2.5";
+    console.log(`[AI] Calling model=${model}, prompt length=${prompt.length}`);
+    const requestBody: any = {
+      model,
+      max_tokens: 8192,
+      messages: [
+        { role: "system", content: systemPrompt || "你是一位專業的中醫學教授，專門協助中醫碩士課程的學生學習。請用繁體中文回答。" },
+        { role: "user", content: prompt },
+      ],
+    };
+    // Disable thinking mode for Kimi K2.5 to get direct JSON output
+    // Kimi K2.5 defaults to thinking mode which wastes tokens on reasoning
+    if (model.includes("kimi")) {
+      requestBody.thinking = { type: "disabled" };
+    }
+    const completion = await client.chat.completions.create(requestBody);
+    const content = completion.choices[0]?.message?.content || "";
+    console.log(`[AI] Response received: ${content.length} chars, first 300: ${content.substring(0, 300)}`);
+    return content;
   } catch (e: any) {
     console.error("AI generation error:", e.message);
+    if (e.response) {
+      try {
+        const errBody = typeof e.response.body === 'string' ? e.response.body : JSON.stringify(e.response.data || e.response.body);
+        console.error("AI error response body:", errBody?.substring?.(0, 500));
+      } catch {}
+    }
     return "AI生成失敗：" + e.message;
   }
 }
 
 export function registerRoutes(server: Server, app: Express) {
+  // ==================== AI DIAGNOSTIC ====================
+  app.get("/api/ai/test", async (_req, res) => {
+    try {
+      const client = getAIClient();
+      if (!client) return res.json({ status: "error", message: "No API key configured" });
+      const model = process.env.AI_MODEL || "kimi-k2.5";
+      const baseURL = process.env.AI_BASE_URL || "https://api.moonshot.ai/v1";
+      console.log(`[AI Test] model=${model}, baseURL=${baseURL}`);
+      const requestBody: any = {
+        model,
+        max_tokens: 256,
+        messages: [
+          { role: "system", content: "You are a helpful assistant." },
+          { role: "user", content: '回覆一個JSON: {"status": "ok", "message": "Kimi連接成功"}' },
+        ],
+      };
+      if (model.includes("kimi")) {
+        requestBody.thinking = { type: "disabled" };
+      }
+      const start = Date.now();
+      const completion = await client.chat.completions.create(requestBody);
+      const elapsed = Date.now() - start;
+      const content = completion.choices[0]?.message?.content || "";
+      const reasoning = (completion.choices[0]?.message as any)?.reasoning_content || null;
+      res.json({
+        status: "ok",
+        model,
+        baseURL,
+        elapsed_ms: elapsed,
+        content,
+        reasoning_content: reasoning,
+        finish_reason: completion.choices[0]?.finish_reason,
+        usage: completion.usage,
+      });
+    } catch (e: any) {
+      res.json({ status: "error", message: e.message, code: e.code, status_code: e.status });
+    }
+  });
+
   // ==================== SEMESTERS ====================
   app.get("/api/semesters", (_req, res) => {
     const semesters = storage.getSemesters();
@@ -493,16 +554,26 @@ ${examType ? `這是${examType === "midterm" ? "期中考" : "期末考"}題目�
 
       const result = await generateWithAI(prompt);
 
+      // Check if AI returned an error message
+      if (result.startsWith("AI生成失敗") || result.startsWith("AI服務未配置")) {
+        console.error("AI generation returned error:", result);
+        return res.status(500).json({ error: result });
+      }
+
+      // Strip markdown code fences if present
+      let cleanResult = result;
+      cleanResult = cleanResult.replace(/```json\s*/gi, "").replace(/```\s*/g, "");
+
       // Robust JSON parsing - try multiple strategies
       let items: any[] | null = null;
       try {
         // Strategy 1: Find JSON array in response
-        const jsonMatch = result.match(/\[[\s\S]*\]/);
+        const jsonMatch = cleanResult.match(/\[[\s\S]*\]/);
         if (jsonMatch) items = JSON.parse(jsonMatch[0]);
       } catch {
         try {
           // Strategy 2: Try to fix truncated JSON by closing brackets
-          const jsonMatch = result.match(/\[[\s\S]*/);
+          const jsonMatch = cleanResult.match(/\[[\s\S]*/);
           if (jsonMatch) {
             let fixed = jsonMatch[0];
             // Count open/close braces and brackets
@@ -515,15 +586,15 @@ ${examType ? `這是${examType === "midterm" ? "期中考" : "期末考"}題目�
         } catch {
           try {
             // Strategy 3: Extract individual JSON objects
-            const objMatches = result.match(/\{[^{}]*"questionType"[^{}]*\}/g);
+            const objMatches = cleanResult.match(/\{[^{}]*"questionType"[^{}]*\}/g);
             if (objMatches) items = objMatches.map(m => JSON.parse(m));
           } catch {}
         }
       }
 
       if (!items || items.length === 0) {
-        console.error("Failed to parse AI response:", result.substring(0, 500));
-        return res.status(500).json({ error: "AI生成題目格式解析失敗，請重試" });
+        console.error("Failed to parse AI response. Length:", result.length, "First 800 chars:", result.substring(0, 800));
+        return res.status(500).json({ error: "AI生成題目格式解析失敗，請重試", debug: result.substring(0, 200) });
       }
 
       const created = [];

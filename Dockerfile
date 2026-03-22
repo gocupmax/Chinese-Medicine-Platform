@@ -11,21 +11,22 @@ RUN pip3 install --break-system-packages pymupdf pytesseract Pillow
 
 WORKDIR /app
 
-# Copy package files and install Node dependencies
+# Copy package files and install ALL dependencies (need devDeps for build)
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm ci
 
 # Copy source and build
 COPY . .
 RUN npm run build
 
-# Create upload directory
+# Create directories
 RUN mkdir -p uploads
 
-# Expose port
 EXPOSE 5000
 
 ENV NODE_ENV=production
 ENV PORT=5000
 
-CMD ["node", "dist/index.cjs"]
+# Use start script that initializes DB then starts server
+RUN chmod +x start.sh
+CMD ["sh", "start.sh"]

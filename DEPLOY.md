@@ -33,7 +33,7 @@ git push -u origin main
 
 | 變量名 | 值 | 說明 |
 |--------|------|------|
-| `ANTHROPIC_API_KEY` | `sk-ant-...` | 你的 Anthropic API Key |
+| `KIMI_API_KEY` | `sk-...` | 你的 Kimi API Key（從 platform.moonshot.ai 獲取） |
 | `PORT` | `5000` | 伺服器端口（Railway 通常自動設定） |
 | `NODE_ENV` | `production` | 生產環境 |
 

@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useCallback } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest, API_BASE } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
@@ -10,9 +10,25 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   ArrowLeft, Upload, FileText, Music, Video, Trash2, Sparkles, Brain,
-  BookOpen, Loader2, CheckCircle, AlertCircle, Play, RefreshCw
+  BookOpen, Loader2, CheckCircle, AlertCircle, Play, RefreshCw, Layers
 } from "lucide-react";
 import type { Subject, Material, StudyContent, Question } from "@shared/schema";
 
@@ -64,6 +80,13 @@ export default function SubjectDetail() {
 
   const [uploadProgress, setUploadProgress] = useState<{ [key: string]: number }>({});
   const [genCount, setGenCount] = useState(10);
+
+  // Batch generation state
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [batchSelected, setBatchSelected] = useState<number[]>([]);
+  const [batchCount, setBatchCount] = useState("30");
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<Record<number, { status: string; count?: number; error?: string }>>({});
 
   const uploadMaterial = useMutation({
     mutationFn: async (file: File) => {
@@ -203,6 +226,81 @@ export default function SubjectDetail() {
       default: return <FileText className="h-4 w-4 text-muted-foreground" />;
     }
   };
+
+  const readableMaterials = materials.filter(m => (m as any).isReadable);
+
+  const toggleBatchItem = (id: number) => {
+    setBatchSelected(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  };
+
+  const startBatchGeneration = useCallback(async () => {
+    if (batchSelected.length === 0) return;
+    setBatchRunning(true);
+    setBatchProgress({});
+
+    // Initialize all as "pending"
+    const initial: Record<number, { status: string }> = {};
+    batchSelected.forEach(id => { initial[id] = { status: "pending" }; });
+    setBatchProgress(initial);
+
+    try {
+      const items = batchSelected.map(materialId => ({ materialId, count: parseInt(batchCount) }));
+      const response = await fetch(`${API_BASE}/api/ai/generate-questions-batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items }),
+      });
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+
+      if (reader) {
+        let buffer = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          // Process SSE events
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                if (data.type === "status") {
+                  setBatchProgress(prev => ({
+                    ...prev,
+                    [data.materialId]: { status: "generating" },
+                  }));
+                } else if (data.type === "progress") {
+                  setBatchProgress(prev => ({
+                    ...prev,
+                    [data.materialId]: {
+                      status: data.success ? "done" : "error",
+                      count: data.count,
+                      error: data.error,
+                    },
+                  }));
+                } else if (data.type === "done") {
+                  // Refresh question data
+                  queryClient.invalidateQueries({ queryKey: ["/api/questions"] });
+                  queryClient.invalidateQueries({ queryKey: ["/api/questions/by-material"] });
+                }
+              } catch {}
+            }
+          }
+        }
+      }
+    } catch (e: any) {
+      toast({ title: "批量生成失敗", description: e.message, variant: "destructive" });
+    } finally {
+      setBatchRunning(false);
+      queryClient.invalidateQueries({ queryKey: ["/api/questions"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/questions/by-material"] });
+    }
+  }, [batchSelected, batchCount, toast]);
 
   return (
     <div className="min-h-screen bg-background">
@@ -367,19 +465,133 @@ export default function SubjectDetail() {
 
           {/* Questions Tab - per PDF lesson sections */}
           <TabsContent value="questions" className="space-y-4">
-            {/* Count selector */}
-            <div className="flex items-center gap-3">
-              <span className="text-sm text-muted-foreground">每次生成</span>
-              <div className="flex gap-1">
-                {[5, 10, 20, 30, 50].map(n => (
-                  <Button key={n} size="sm" variant={genCount === n ? "default" : "outline"} onClick={() => setGenCount(n)} className="h-7 px-2 text-xs">
-                    {n}題
-                  </Button>
-                ))}
+            {/* Count selector + batch button */}
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div className="flex items-center gap-3">
+                <span className="text-sm text-muted-foreground">每次生成</span>
+                <div className="flex gap-1">
+                  {[5, 10, 20, 30, 50].map(n => (
+                    <Button key={n} size="sm" variant={genCount === n ? "default" : "outline"} onClick={() => setGenCount(n)} className="h-7 px-2 text-xs">
+                      {n}題
+                    </Button>
+                  ))}
+                </div>
               </div>
+              {readableMaterials.length > 1 && (
+                <Dialog open={batchOpen} onOpenChange={setBatchOpen}>
+                  <DialogTrigger asChild>
+                    <Button variant="outline" size="sm" className="gap-1.5">
+                      <Layers className="h-3.5 w-3.5" />
+                      批量生成
+                    </Button>
+                  </DialogTrigger>
+                  <DialogContent className="max-w-md">
+                    <DialogHeader>
+                      <DialogTitle>批量生成題目</DialogTitle>
+                      <DialogDescription>
+                        選擇多份PDF同時生成題目
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className="space-y-4">
+                      {/* Count selector */}
+                      <div className="flex items-center gap-3">
+                        <span className="text-sm">每份生成</span>
+                        <Select value={batchCount} onValueChange={setBatchCount}>
+                          <SelectTrigger className="w-24">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="10">10 題</SelectItem>
+                            <SelectItem value="20">20 題</SelectItem>
+                            <SelectItem value="30">30 題</SelectItem>
+                            <SelectItem value="50">50 題</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      {/* Select all */}
+                      <div className="flex items-center gap-2">
+                        <Checkbox
+                          checked={batchSelected.length === readableMaterials.length && readableMaterials.length > 0}
+                          onCheckedChange={(checked) => {
+                            setBatchSelected(checked ? readableMaterials.map(m => m.id) : []);
+                          }}
+                        />
+                        <span className="text-sm font-medium">全選 ({readableMaterials.length} 份)</span>
+                      </div>
+
+                      <Separator />
+
+                      {/* Material list */}
+                      <ScrollArea className="max-h-60">
+                        <div className="space-y-2">
+                          {readableMaterials.map(m => {
+                            const progress = batchProgress[m.id];
+                            return (
+                              <div key={m.id} className="flex items-center gap-3 p-2 rounded-lg hover:bg-muted/50">
+                                <Checkbox
+                                  checked={batchSelected.includes(m.id)}
+                                  onCheckedChange={() => toggleBatchItem(m.id)}
+                                  disabled={batchRunning}
+                                />
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-sm truncate">{m.filename.replace(/\.[^.]+$/, "")}</p>
+                                  <p className="text-xs text-muted-foreground">
+                                    {((m as any).extractedTextLength / 1000).toFixed(1)}k 字 · {qByMaterial[m.id] || 0} 題
+                                  </p>
+                                </div>
+                                {progress && (
+                                  <div className="flex-shrink-0">
+                                    {progress.status === "pending" && (
+                                      <span className="text-xs text-muted-foreground">等待中</span>
+                                    )}
+                                    {progress.status === "generating" && (
+                                      <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                                    )}
+                                    {progress.status === "done" && (
+                                      <span className="flex items-center gap-1 text-xs text-green-600">
+                                        <CheckCircle className="h-3.5 w-3.5" />
+                                        +{progress.count}題
+                                      </span>
+                                    )}
+                                    {progress.status === "error" && (
+                                      <span className="flex items-center gap-1 text-xs text-destructive">
+                                        <AlertCircle className="h-3.5 w-3.5" />
+                                        失敗
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </ScrollArea>
+
+                      <Button
+                        className="w-full gap-2"
+                        onClick={startBatchGeneration}
+                        disabled={batchSelected.length === 0 || batchRunning}
+                      >
+                        {batchRunning ? (
+                          <>
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                            生成中...
+                          </>
+                        ) : (
+                          <>
+                            <Sparkles className="h-4 w-4" />
+                            開始生成 ({batchSelected.length} 份 × {batchCount} 題)
+                          </>
+                        )}
+                      </Button>
+                    </div>
+                  </DialogContent>
+                </Dialog>
+              )}
             </div>
 
-            {materials.filter(m => (m as any).isReadable).map((m) => {
+            {readableMaterials.map((m) => {
               const qCount = qByMaterial[m.id] || 0;
               const lessonName = m.filename.replace(/\.[^.]+$/, "");
               return (

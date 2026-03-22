@@ -444,11 +444,18 @@ export function registerRoutes(server: Server, app: Express) {
       // Clean up chunks directory
       fs.rmSync(uploadDir, { recursive: true, force: true });
 
-      // Upload to Supabase Storage
+      // Upload to Supabase Storage (with fallback to local if upload fails)
       const fileBuffer = fs.readFileSync(localTmpPath);
       const ext = path.extname(originalName).toLowerCase();
       const supabasePath = `${subjectId}/${uploadId}${ext}`;
-      const storedPath = await uploadFile(BUCKET, supabasePath, fileBuffer, getMimeType(ext));
+      let storedPath: string | null = null;
+      try {
+        storedPath = await uploadFile(BUCKET, supabasePath, fileBuffer, getMimeType(ext));
+        console.log(`File uploaded to storage: ${storedPath} (${fileBuffer.length} bytes)`);
+      } catch (uploadErr: any) {
+        console.error(`Supabase upload failed, keeping local: ${uploadErr.message}`);
+        storedPath = localTmpPath; // fallback to local file
+      }
 
       // Determine file type
       let fileType = "text";

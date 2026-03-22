@@ -90,7 +90,7 @@ export default function SubjectDetail() {
 
   const uploadMaterial = useMutation({
     mutationFn: async (file: File) => {
-      const CHUNK_SIZE = 7 * 1024 * 1024; // 7MB per chunk (proxy limit is 10MB)
+      const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB per chunk (Railway proxy limit)
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
       const filename = file.name;
 
@@ -102,7 +102,7 @@ export default function SubjectDetail() {
       });
       const { uploadId } = await initRes.json();
 
-      // Step 2: Upload chunks
+      // Step 2: Upload chunks with retry
       for (let i = 0; i < totalChunks; i++) {
         const start = i * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, file.size);
@@ -113,13 +113,27 @@ export default function SubjectDetail() {
         formData.append("uploadId", uploadId);
         formData.append("chunkIndex", String(i));
 
-        const chunkRes = await fetch(`${API_BASE}/api/materials/upload/chunk`, {
-          method: "POST",
-          body: formData,
-        });
-        if (!chunkRes.ok) {
-          const errText = await chunkRes.text().catch(() => chunkRes.statusText);
-          throw new Error(`分片 ${i + 1}/${totalChunks} 上傳失敗: ${errText}`);
+        let lastErr = "";
+        let success = false;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const chunkRes = await fetch(`${API_BASE}/api/materials/upload/chunk`, {
+              method: "POST",
+              body: formData,
+            });
+            if (chunkRes.ok) {
+              success = true;
+              break;
+            }
+            lastErr = await chunkRes.text().catch(() => chunkRes.statusText);
+          } catch (e: any) {
+            lastErr = e.message;
+          }
+          // Wait before retry
+          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        }
+        if (!success) {
+          throw new Error(`分片 ${i + 1}/${totalChunks} 上傳失敗: ${lastErr}`);
         }
         setUploadProgress(prev => ({ ...prev, [filename]: Math.round(((i + 1) / totalChunks) * 100) }));
       }
